@@ -1,0 +1,124 @@
+name: tests
+
+# Every push and every pull request. The suite is seconds long -- it stubs all
+# inference and needs no GPU, no weights and no network -- so there is no
+# reason to gate it on paths or on a label.
+on:
+  push:
+  pull_request:
+
+# A second push to the same branch makes the first run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-tests:
+    name: server suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image is prebuilt and pulled, never built here. Building the
+      # deployment image is a separate job below: it is ~15 GB, it installs one
+      # virtualenv per tool, and it needs the tools repository as a named build
+      # context -- none of which the server suite exercises.
+      #
+      # No registry login: ghcr.io/jules-gp/lab-ai is a PUBLIC package. Checked
+      # rather than assumed -- `docker manifest inspect` succeeds logged out,
+      # and ghcr.io issues an anonymous pull token for it. If it is ever made
+      # private this job fails on the pull, which is the right failure: a
+      # login-action carried "just in case" is dead weight that also hides the
+      # change of state.
+
+      # `DATA/` is a read-only bind mount in the compose file. Docker would
+      # create it as root if it were missing, which is what broke every fresh
+      # install before scripts/server_ctl.py started creating it -- same
+      # reasoning here, one line earlier.
+      - name: Create the DATA mount point
+        run: mkdir -p DATA
+
+      # Deliberately the SAME command the pre-push hook runs, rather than a
+      # bare `pytest`. CI that reproduces a different gesture from the local
+      # one drifts from it, and then a green CI stops meaning "this would have
+      # passed before you pushed".
+      #
+      # RUN_REAL_DATA_TESTS is not set, so tests/test_data_integration.py
+      # skips at collection: it runs real inference against whatever is staged
+      # under DATA/, which is empty here and hours long on a CPU anyway.
+      - name: Run the server suite
+        run: docker compose run --rm test
+
+  deployment-image:
+    name: deployment image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Only when the image definition itself changes. It is expensive and it
+    # exercises nothing the suite above covers.
+    if: >
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not a shallow clone: the step below diffs against the
+          # PR's merge base, which on a long-lived branch is far more than a
+          # couple of commits back. `fetch-depth: 2` makes that `git diff` fail
+          # with "bad object" rather than answer wrongly, but failing is not
+          # better here.
+          fetch-depth: 0
+
+      # Deliberately a step, not a `paths:` filter on the job: a filtered job
+      # reports as SKIPPED, and a skipped job is not a successful one -- it
+      # would block a required check forever. This way the job always runs and
+      # always reports green; only the expensive part is conditional.
+      #
+      # The base is the PR's merge base on a pull_request, so a five-commit PR
+      # touching docker/ in its first commit is still caught. HEAD~1 only holds
+      # on a push.
+      - name: Did docker/ change?
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "${BASE_SHA:-}" ]; then
+            base="$BASE_SHA"
+          elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+            base="HEAD~1"
+          else
+            # A first commit has nothing to compare against: build it.
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --quiet "$base" HEAD -- docker/ .github/workflows/tests.yml; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.changed.outputs.run == 'true'
+
+      # Built against docker/fixtures/, not the real tools: three tools with
+      # deliberately incompatible pins and no GPU requirement. That is what
+      # they exist for -- it proves the one-image-N-virtualenvs arrangement
+      # still resolves without pulling a CUDA stack or the other repository.
+      - name: Build with the fixture tools
+        if: steps.changed.outputs.run == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-contexts: tools=docker/fixtures
+          push: false
+          load: true
+          tags: sadt:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The whole point of the image: the venvs are hardlinked rather than
+      # copied. A regression here is silent and costs ~80 MB per duplicated
+      # dependency, so it is asserted rather than assumed.
+      - name: Verify the virtualenvs are deduplicated
+        if: steps.changed.outputs.run == 'true'
+        run: docker run --rm sadt:ci python /opt/sadt/verify_dedup.py
