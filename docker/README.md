@@ -124,6 +124,22 @@ python points at nothing.
 
     -v /home/you/.local/share/uv:/home/you/.local/share/uv:ro
 
+**`--shm-size` is not optional for the nnUNet tools.** Docker gives a container
+64 MB of `/dev/shm`; nnUNet's export workers pass data through shared memory and
+die without saying so. What you get is:
+
+    RuntimeError: Background workers died. Look for the error message further
+    up! If there is none then your RAM was full and the worker was killed
+
+The message names **RAM**, and the host had 63 GB free. The constraint is
+`/dev/shm`. `docker-compose.yml` already sets `shm_size: 8gb` on both services,
+so this bites only a bare `docker run`:
+
+    --shm-size=8g
+
+Found by hitting it: Batch_Dental_Seg answered 500 over HTTP while the identical
+run succeeded directly on the host, whose `/dev/shm` is half of RAM.
+
 **And the schemas have to come from somewhere.** `.schema.json` is a cache, not
 a committed file. Without `DESCRIBE_PATH` pointing at `sadt-tools/scripts/describe.py`
 and a writable `SCHEMA_CACHE_DIR`, every packaged tool fails to load. The server
