@@ -327,3 +327,34 @@ def test_the_result_carries_no_vram_figure_when_the_tool_never_touched_torch(too
     )
     assert "result" in result
     assert "peak_vram_bytes" not in result
+
+
+def test_a_supervised_tool_is_found_inside_a_grouping_folder(tools_dir, tmp_path):
+    """`tools/ALI/ALI_CBCT` is the tool `ALI_CBCT`, not `ALI/ALI_CBCT`.
+
+    A grouping folder holds several tools and is not one itself, so the name a
+    caller uses no longer matches a top-level directory. Without this lookup,
+    the split that created ALI_CBCT and ALI_IOS silently broke every
+    `sup.run("ALI_CBCT", ...)` -- loudly in fact, RunnerError naming the tool,
+    which is the right failure but still a broken chain.
+    """
+    make_tool(tools_dir, "Leaf", LEAF)
+    # Move it under a group, exactly as tools/ALI/ALI_CBCT sits.
+    group = tools_dir / "Group"
+    group.mkdir()
+    (tools_dir / "Leaf").rename(group / "Leaf")
+
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call a tool that lives under a grouping folder.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf")
+        return output_dir
+    """)
+
+    completed, _ = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+    )
+    assert completed.returncode == 0, completed.stderr

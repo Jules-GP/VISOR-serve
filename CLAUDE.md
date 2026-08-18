@@ -22,6 +22,15 @@ Do **not** add Celery/Redis/async job queues yet.
 
 ## Core design: a `Tool` base class
 
+> **Historical, and still half true.** This section is the original brief, and
+> it is what `base.py` still implements — `ArgSpec`, `validate()` before
+> `run()`, `ToolArgumentError` → 422. What changed is where a tool's
+> declaration comes from: a clinical tool is no longer a subclass here, it is a
+> `.schema.json` generated from a `run()` signature in `sadt-tools`, which the
+> registry turns into exactly this object (`registry/schema_tool.py`). Read the
+> contract below as the contract the SERVER honours; read `ADDING_A_TOOL.md`
+> for how a tool is actually written today.
+
 Every tool is a **class deriving from a common `Tool` base class**. A tool declares:
 
 1. **A unique name** (used to select it over the wire, e.g. `"Test_Tool"`).
@@ -79,63 +88,108 @@ validation-before-run + clear error on mismatch.
 
 ## Scalable tool discovery (the registry)
 
-Tools live in a **`tools/` package**, one file per tool (or grouped logically). The
-server builds its registry by **auto-discovering every `Tool` subclass** in that
-package at startup — e.g. import all modules in `tools/`, collect every subclass of
-`Tool`, and index them by their `name`. Adding a tool = dropping a new file in
-`tools/` that defines a `Tool` subclass. **No central list to edit.**
+`server/registry/` discovers **two kinds of tool**, side by side, and
+`GET /tools` publishes them identically — a client cannot tell which is which.
 
-- Detect and reject **duplicate tool names** at startup with a clear error.
-- Expose the registry as `name -> Tool instance` (or class).
+1. **A folder under `TOOLS_DIR` holding a `.schema.json`** (every clinical tool).
+   The server reads the JSON, checks it against the hash of the `src/` beside
+   it, and builds a `Tool` from it. **It imports nothing.** That is the whole
+   point: the tool's dependencies have nothing to agree with the server's, and
+   two tools wanting incompatible versions of torch stop being each other's
+   problem. A folder that has a `.schema.json` is never imported.
+2. **A `Tool` subclass under `server/tools/<name>/<name>.py`** (the two demos).
+   Imported into this process at startup, the way every tool used to be.
+
+Rules that hold for both:
+
+- **Duplicate names are rejected** at startup, comparing case- and
+  separator-insensitively (`Batch_Dental_Seg` and `BatchDentalSeg` are the same
+  tool written two ways).
+- **A tool that will not load is SKIPPED, never fatal.** With 15+ tools, one
+  missing model must not block the others. It is logged in a banner, kept in
+  `FAILED_TOOLS`, and named again by `get_tool()`.
+- **The one exception is a `source_hash` that cannot be resolved.** A stale
+  hash is a stale cache and is REGENERATED (`registry/schema_tool.resolve_schema`,
+  which runs `describe.py` with the tool's own interpreter). A schema with no
+  hash at all is unverifiable and is skipped.
+- **A leading `_` excludes a folder from discovery**, which is what keeps
+  `_dispatch_probe/` and `_AREG/` out of `GET /tools`.
+- `TOOLS: dict[str, Tool]`, and `get_tool(name)` raises → `404`.
 
 ## The registered tools
 
-(Originally only `Test_Tool` existed; see the changelog for how the rest arrived.)
+Every clinical tool now lives in **`sadt-tools`**, one isolated project each,
+and is served from `TOOLS_DIR` without this server importing a line of it.
+Names are what a client sends to `/run/<name>`, and they are the folder names
+on that side:
 
-- `Test_Tool` — two required strings in, their concatenation out. Proves the
-  round trip and serves as the minimal copy-paste template.
-- `Example_Tool` — the feature showcase: multi-type input (`csv_file` or
-  `folder`), `choice`/`multichoice` arguments, `output_kind = "files"`.
-- `SurgMovPred` — surgical movement prediction from tabular measurements
-  (stacking models, server-side model bundles).
 - `AMASSS` — CBCT skull structure segmentation (nnUNet v2, GPU).
-- `ASO` — automated standardized orientation, CBCT and intra-oral scans. Its
-  fully-automated CBCT mode calls `ALI` in-process for the landmarks.
 - `ALI` — automatic landmark identification, on CBCT volumes (deep-RL agents)
   or intraoral surface scans (multi-view rendering + 2D UNet). The engine is
   chosen from the data, not from an argument.
-- `CrownSeg` — per-tooth labelling of intraoral scans (shapeaxi). Its own tool
+- `ASO` — automated standardized orientation, CBCT and intra-oral scans. Its
+  fully-automated CBCT mode calls `ALI` **mid-run**, through the supervisor.
+- `AREG` — registration of two timepoints. Drives `AMASSS`, `ASO`, `Crown_Seg`
+  and (through ASO) `ALI`, all through the supervisor.
+- `Crown_Seg` — per-tooth labelling of intraoral scans (shapeaxi). Its own tool
   rather than a helper inside ALI, because ASO, AREG and FlexReg need it too.
-- `BatchDentalSeg` — teeth and jaw structures on dental CT/CBCT, one scan or a
+- `Batch_Dental_Seg` — teeth and jaw structures on dental CT/CBCT, one scan or a
   whole cohort (nnUNet v2, GPU). Four trained models that label different
   things; the hosted bundle name selects the weights and their label table
   together.
+- `Surg_Mov_Pred` — surgical movement prediction from tabular measurements
+  (stacking models, server-side model bundles).
+
+Two in-process tools stay in this repository, and only these two. They are the
+demonstration of the `Tool`/`ArgSpec` path, not clinical tools:
+
+- `Test_Tool` — two required strings in, their concatenation out. Proves the
+  round trip end to end with no dependency at all.
+- `Example_Tool` — the feature showcase: multi-type input (`csv_file` or
+  `folder`), `choice`/`multichoice` arguments, `output_kind = "files"`.
 
 The extension will eventually expose ~15+ tools; the architecture must
 accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 
 ## Target architecture
 
+Three repositories, and the seams between them are the design:
+
 ```
-┌──────────────────────┐        HTTPS / TLS              ┌──────────────────────────┐
-│  3D Slicer module    │  ── POST /run/{tool_name} ────► │  FastAPI server          │
-│  (client, requests)  │      (args [+ file], token)     │  (Uvicorn)               │
-│                      │                                 │  - verify token          │
-│                      │                                 │  - registry.get(name)    │
-│                      │  ◄── 200 + result ──────────────│  - tool.validate(args)   │
-│                      │                                 │  - tool.run(**args)      │
-│                      │                                 │  - return result         │
-└──────────────────────┘                                 │  - cleanup temp files    │
-                                                          └──────────────────────────┘
+ SlicerAutomatedDentalToolsCloud        slicer-remote-tool-server              sadt-tools
+ ┌────────────────────────┐  HTTPS  ┌───────────────────────────┐        ┌────────────────────┐
+ │ 3D Slicer modules      │ ──────► │ FastAPI (uvicorn)         │        │ tools/<Name>/      │
+ │  - build the panel     │ POST    │  - verify token           │        │   pyproject.toml   │
+ │    from GET /tools     │ /run/X  │  - registry.get(name)     │        │   uv.lock          │
+ │  - upload in parallel  │         │  - tool.validate(args)    │        │   src/sadt_<name>/ │
+ │  - load the result     │ ◄────── │  - dispatch → subprocess ─┼──exec──►   run(...)         │
+ └────────────────────────┘  200    │  - stream / reference     │        │   .venv/  (its own │
+                                    │  - delete every temp file │        │           torch)   │
+                                    └───────────────────────────┘        └────────────────────┘
+        knows only the schema            knows no dental tool               knows no server
 ```
+
+The middle box imports nothing from the right-hand one. It runs it:
+
+```
+<TOOLS_DIR>/<tool>/.venv/bin/python <RUNNER_PATH> --job <job dir>/job.json
+```
+
+`runner.py` ships with the SERVER and is injected by path, never installed into
+a tool's venv — so runner and server are always the same version and there is
+no cross-repo skew to negotiate. It reads `job.json`, imports the tool from its
+`src/`, calls `run(**params)`, and writes `result.json`. A tool that declares
+`*, sup` also receives a **supervisor** and can call another tool; that call
+re-enters the same file with the sibling's interpreter, so chaining and nesting
+(`AREG → ASO → ALI`) are one recursion rather than a feature.
 
 ## Repo structure
 
 ```
 .
 ├── CLAUDE.md
-├── ADDING_A_TOOL.md         # the full contract for writing a tool
-├── MIGRATING_A_TOOL.md      # moving one tool out of the server, and proving it
+├── ADDING_A_TOOL.md         # the contract for writing a tool (in sadt-tools)
+├── MIGRATING_A_TOOL.md      # the record of how the tools left this repo
 ├── docker-compose.yml       # inference (GPU) + inference-cpu + inference-venvs + test services
 ├── docker/                  # the deployment image: one container, N tool virtualenvs
 │   ├── Dockerfile           #   /opt/sadt (API, no torch) + /tools/<name>/.venv
@@ -144,9 +198,12 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   └── README.md
 ├── .env.example             # the three variables compose interpolates
 ├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
+├── .github/workflows/       # the same suite on every push and PR, plus the image build
+├── run-local.sh             # a local server serving a sadt-tools checkout, port 8001
 ├── scripts/                 # stand the server up, and populate DATA/
 │   ├── setup-server.sh      #   curl-pipeable: clone, check docker, start
 │   ├── install-docker.sh    #   Docker Engine + compose plugin (Linux, root)
+│   ├── install-docker-gpu.sh#   ... plus the NVIDIA container toolkit
 │   ├── server_ctl.py        #   the deployment engine: status/up/update/down/catalog/models
 │   ├── setup-models.sh      #   curl-pipeable entry points
 │   ├── setup-testfiles.sh
@@ -155,40 +212,42 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 ├── server/
 │   ├── main.py              # FastAPI app: /run/{tool_name}, /uploads, /results
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
-│   ├── registry.py          # discovery: .schema.json tools, and Tool subclasses in tools/
-│   ├── parity.py            # run a tool both ways and compare what a caller receives
-│   ├── dispatch.py          # runs a tool in its own venv, as a subprocess (SADT_DISPATCH_MODE)
-│   ├── runner.py            # the other side of that: stdlib only, executed BY a tool's venv
-│   ├── schema_tool.py       # a tool built from its .schema.json, never imported
-│   ├── schema_hash.py       # source_hash: the reference implementation, executable
-│   ├── deployment.py        # deployment.toml: per-tool server-side config
-│   ├── deployment.toml.example
+│   ├── config.py            # every setting, from the environment
 │   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
 │   ├── file_utils.py        # shared helpers: scratch dirs, zip, scan extensions, tabular loading
-│   ├── transfer.py          # chunked resumable uploads, range-served results
-│   ├── security.py          # Bearer token verification
-│   ├── config.py            # config from environment variables
-│   ├── tools/               # one folder per tool: tools/<name>/<name>.py (+ src/, test/)
-│   │   ├── _dispatch_probe/ # test fixture, NOT a tool: underscore = never discovered
-│   │   ├── Test_Tool/
-│   │   ├── Example_Tool/
-│   │   ├── SurgMovPred/
-│   │   ├── AMASSS/
-│   │   ├── ASO/
-│   │   ├── CrownSeg/
-│   │   ├── BatchDentalSeg/
-│   │   └── ALI/
-│   │       └── src/         # ALILogic.py dispatches; one folder per engine
-│   │           ├── ALI_CBCT/
-│   │           ├── ALI_IOS/
-│   │           └── markups/ # shared by both engines, no other tool needs it yet
-│   ├── tests/               # HTTP-layer + integration tests
-│   ├── requirements.txt
+│   ├── registry/            # what this server serves, and how it decided
+│   │   ├── __init__.py      #   discovery: .schema.json folders, then tools/ subclasses
+│   │   ├── schema_tool.py   #   a Tool built from a .schema.json, never imported
+│   │   ├── schema_hash.py   #   source_hash: the reference implementation, executable
+│   │   ├── conventions.py   #   what a tool gets with NO configuration at all
+│   │   └── deployment.py    #   deployment.toml: the per-tool exceptions
+│   ├── execution/           # running a tool, out of process
+│   │   ├── dispatch.py      #   server side: job dir, GPU slot, timeout, error mapping
+│   │   ├── runner.py        #   tool side: stdlib only, executed BY a tool's venv, injects `sup`
+│   │   └── parity.py        #   run a tool both ways and compare what a caller receives
+│   ├── wire/                # the HTTP edge that is not routing
+│   │   ├── transfer.py      #   chunked resumable uploads, range-served results
+│   │   └── security.py      #   Bearer token verification
+│   ├── deployment.toml      # per-tool overrides; empty, because the conventions cover them
+│   ├── deployment.toml.example
+│   ├── tools/               # NOT where the tools are any more — see below
+│   │   ├── _dispatch_probe/ # test fixture: underscore = never discovered
+│   │   ├── _AREG/           # the parked in-process AREG, kept for its history
+│   │   ├── Test_Tool/       # in-process demo: the minimal round trip
+│   │   └── Example_Tool/    # in-process demo: multi-type input, choices, files out
+│   ├── tests/               # HTTP-layer + integration tests, GPU- and weight-free
+│   ├── requirements.txt     # what a dev checkout installs
+│   ├── requirements-api.txt # what the API itself needs: fastapi, uvicorn, and nothing heavier
 │   ├── requirements-dev.txt
 │   ├── .env.example
 │   └── README.md
 └── DATA/                    # DATA_DIR mount, read-only, gitignored: <tool_name>/{models,testfiles}/
 ```
+
+**The real tools are not in this repository.** They live in `sadt-tools`, one
+isolated project each, and reach this server through `TOOLS_DIR` — a folder of
+`<Tool_Name>/{.schema.json,.venv,src}`. `server/tools/` keeps only the two
+in-process demos, the dispatch fixture, and the parked `_AREG`.
 
 The Slicer client (thin modules + the generic inference client) lives in its
 own repo, `SlicerAutomatedDentalToolsCloud` — not here. Its **Slicer Cloud**
@@ -213,11 +272,33 @@ needing an extension release.
 - `validate` enforces: required present, no unknowns, type match/coercion; raises
   `ToolArgumentError` with a precise message otherwise.
 
-### `registry.py`
-- Auto-discovers every `Tool` subclass under the `tools/` package at import time.
-- Builds `TOOLS: dict[str, Tool]` keyed by `name`.
-- Raises on duplicate names.
-- `get_tool(name) -> Tool` raises a not-found error (→ `404`) for unknown names.
+### `registry/`
+- `__init__.py` — discovery (both kinds, see above), `TOOLS`, `FAILED_TOOLS`,
+  `get_tool(name)`.
+- `schema_tool.py` — a `.schema.json` turned into a `Tool`, plus the schema
+  vocabulary the two repositories agree on. An unknown key is a **warning**,
+  never a refusal: this is the seam between two repositories, and a field one
+  side adds must not stop the other from starting.
+- `schema_hash.py` — `source_hash`, executable as
+  `python server/registry/schema_hash.py <src>` so the generator on the other
+  side can be checked against it byte for byte.
+- `conventions.py` — **what a tool gets with no configuration at all.** An
+  argument named `model`, `*_model` or `*_reference` is published as a name
+  picked from `DATA/<tool>/models/` and can never be uploaded; any other `path`
+  may also be filled from `DATA/<tool>/testfiles/`; an argument in `TECHNICAL`
+  (`device`, `tile_step_size`, `num_workers`, `seed`, …) is not rendered to a
+  clinician. Adding a tool needs no edit to this repository.
+- `deployment.py` — `deployment.toml`, the exceptions to those conventions,
+  merged per argument over them.
+
+### `execution/`
+- `dispatch.py` — the server half of a run: job directory, `job.json`, the GPU
+  slot, the timeout, and the mapping from a tool's exception class NAME to a
+  status code.
+- `runner.py` — the tool half, executed **by the tool's own interpreter**.
+  Standard library only, 3.9 → 3.13, injected by absolute path so runner and
+  server are always the same version. It also injects the **supervisor**.
+- `parity.py` — run one tool both ways and compare what a caller receives.
 
 ### `data_store.py` — server-side models and test files
 Lets a tool argument be satisfied by a file already present on the server (an AI
@@ -247,8 +328,11 @@ model, a reference test dataset) instead of the client uploading it every call.
   No change needed anywhere else.
 
 ### `tools/Test_Tool/Test_Tool.py`
-- Defines `TestTool(Tool)` with `name = "Test_Tool"`, the two required string args,
-  and a `run` returning a str. Serves as the copy-paste template for future tools.
+- Defines `TestTool(Tool)` with `name = "Test_Tool"`, the two required string
+  args, and a `run` returning a str. It is the minimal proof that the HTTP
+  round trip works with no dependency in the way — **not** the template for a
+  new tool any more. A new tool is a package in `sadt-tools`; see
+  `ADDING_A_TOOL.md`.
 
 ### Endpoints (`main.py`)
 1. `GET /health` → `{"status": "ok"}`, no auth.
@@ -338,19 +422,28 @@ Worst case for patient data left on disk by a client that died mid-download:
 `TRANSFER_TTL_SECONDS + TRANSFER_SWEEP_SECONDS`, about 16 minutes, with no
 dependency on when the next request arrives.
 
-### `security.py`, `config.py`
+### `wire/security.py`, `config.py`
 - Bearer token from env (`API_TOKEN`), constant-time compare, `401` on failure.
-- Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
-  `TEMP_DIR`, `MAX_CONCURRENT_TOOLS`, `AMASSS_MAX_GPU_JOBS`, `ALLOWED_EXTENSIONS`,
-  `DATA_DIR`, `DATA_BACKEND`, `UPLOAD_CHUNK_MB`, `TRANSFER_TTL_SECONDS`,
-  `TRANSFER_SWEEP_SECONDS`, `RESULT_REFERENCE_MIN_MB`. Sensible dev defaults.
-- **Every setting goes through `config.Settings`** — no tool reads `os.getenv`
-  directly, even for a knob only it uses, so the whole configuration stays
-  discoverable in one file and documented in `.env.example`.
-- A setting a tool reads must be reachable: an argument default like
-  `device: str = "cpu"` in a function signature short-circuits
-  `device or settings.DEVICE` and makes the environment variable dead. Default
-  such parameters to `None` and let the setting be the single source of truth.
+- Config from env, grouped as `config.py` groups them:
+  - **core** — `API_TOKEN`, `DEVICE`, `TEMP_DIR`, `DATA_DIR`, `DATA_BACKEND`.
+  - **running a tool** — `SADT_DISPATCH_MODE`, `TOOLS_DIR`, `RUNNER_PATH`,
+    `DESCRIBE_PATH`, `SCHEMA_CACHE_DIR`, `DEPLOYMENT_CONFIG`, `SADT_API`,
+    `MAX_CONCURRENT_TOOLS`, `MAX_CONCURRENT_GPU_JOBS`, `TOOL_TIMEOUT_SECONDS`.
+  - **uploads and results** — `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
+    `UPLOAD_CHUNK_MB`, `TRANSFER_TTL_SECONDS`, `TRANSFER_SWEEP_SECONDS`,
+    `RESULT_REFERENCE_MIN_MB`, `ZIP_COMPRESSLEVEL`, `ALLOWED_EXTENSIONS`.
+- **`MAX_CONCURRENT_GPU_JOBS` is one counter ACROSS tools.** The per-tool
+  semaphores went with the tools that held them: a packaged tool is its own
+  process, so an in-process semaphore would cap nothing, and an AMASSS run and
+  a `Crown_Seg` run want the same card. A run is **assumed** to want the GPU
+  unless it declares `device` and resolves it to a CPU value — the safe default
+  is the strict one, because a tool that quietly imports torch without
+  declaring `device` would otherwise never queue at all.
+- **Every setting goes through `config.Settings`** — nothing reads `os.getenv`
+  directly, so the whole configuration stays discoverable in one file and
+  documented in `.env.example`. A *tool* now reads no setting at all: what used
+  to be `settings.AMASSS_TILE_STEP_SIZE` is an argument of `run()` with the
+  same default, and the server passes it only to override.
 
 ### Security / confidentiality — hard requirements
 - **TLS mandatory**; README documents HTTPS + self-signed cert for dev, real cert
@@ -419,11 +512,19 @@ Provide a small, generic client mirroring the server:
 - No temp files left behind.
 
 ## Out of scope for this iteration (do not implement)
-- Job queue / Celery / Redis / async polling.
-- Real GPU inference (the test tool is trivial).
-- Model/GPU memory management (note it for later, don't build it).
-- Scaling (multi-process / multi-machine) / database. (In-process parallelism IS
-  implemented: tool runs execute concurrently in worker threads, see changelog.)
+- Job queue / Celery / Redis / async polling. The contract stays blocking
+  request/response.
+- Scaling across machines, and a database.
+- **VRAM budgeting.** `MAX_CONCURRENT_GPU_JOBS` is a job counter, not a memory
+  one, and a supervised chain is invisible to it (a nested call is a subprocess
+  of its parent, not a new admission). `runner.py` records
+  `peak_vram_bytes` per run precisely so a real budget can later be set from
+  measurements rather than guesses — that instrumentation is in, the policy is
+  not.
+
+Already implemented, despite earlier versions of this list: real GPU inference,
+out-of-process execution, and in-process parallelism (tool runs execute
+concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
 
 ## Changelog
 

@@ -475,14 +475,41 @@ class _Supervisor:
     # -- internals ----------------------------------------------------------
 
     def _interpreter(self, tool: str) -> str:
-        for relative in (os.path.join("bin", "python"), os.path.join("Scripts", "python.exe")):
-            candidate = os.path.join(self._tools_dir, tool, ".venv", relative)
-            if os.path.isfile(candidate):
-                return candidate
+        """The tool's own python, wherever its folder sits.
+
+        Searched one level deep as well as at the top, because a tool may live
+        under a GROUPING folder: `ALI_CBCT` and `ALI_IOS` are two tools inside
+        `tools/ALI/`, which holds no tool of its own. The folder name is the
+        tool name either way -- only its depth varies -- so this stays a lookup
+        rather than a scan of every pyproject, which this file could not read
+        anyway (stdlib only, and tomllib does not exist before 3.11).
+
+        Depth is capped at 2 on purpose: deeper would start matching a tool's
+        own vendored directories.
+        """
+        for folder in self._candidate_folders(tool):
+            for relative in (os.path.join("bin", "python"), os.path.join("Scripts", "python.exe")):
+                candidate = os.path.join(folder, ".venv", relative)
+                if os.path.isfile(candidate):
+                    return candidate
         raise RunnerError(
-            f"Supervised tool '{tool}' has no virtualenv under "
-            f"{os.path.join(self._tools_dir, tool)}. It is not deployed here."
+            f"Supervised tool '{tool}' has no virtualenv under {self._tools_dir} "
+            f"(looked for '{tool}/.venv' and '*/{tool}/.venv'). It is not deployed here."
         )
+
+    def _candidate_folders(self, tool: str):
+        """`<tools>/<tool>` first, then `<tools>/*/<tool>`."""
+        yield os.path.join(self._tools_dir, tool)
+        try:
+            groups = sorted(os.listdir(self._tools_dir))
+        except OSError:
+            return
+        for group in groups:
+            if group == tool:
+                continue
+            nested = os.path.join(self._tools_dir, group, tool)
+            if os.path.isdir(nested):
+                yield nested
 
     def _result(self, tool: str, nested_dir: str):
         path = os.path.join(nested_dir, RESULT_FILE)
