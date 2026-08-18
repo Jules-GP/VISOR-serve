@@ -254,6 +254,20 @@ every field. The short version:
 
 ## Checksums
 
+**71 of the 77 entries carry no checksum, and that is a gap rather than a
+design.** For almost everything under `DATA/` the only thing verified is the
+byte count, so an upstream artefact replaced in place — or a download truncated
+at exactly the right size — passes. These are model weights and patient test
+data on a server built for confidential imaging. `fetch_data.py` proceeds on a
+missing `sha256` with a log line rather than a refusal, which reads as a check
+that happened.
+
+**Backlog, not blocking:** every entry gets a `sha256`, and `fetch_data.py`
+warns loudly or refuses rather than logging quietly when one is absent. Raised
+2026-08-18, when `IOSCBCT_TestFile` downloaded with `no sha256 in the manifest`
+and nothing stopped.
+
+
 `sha256` is optional and mostly absent today. When present it is verified and
 a mismatch discards the download rather than installing it. To pin an entry,
 run the fetch once, take the hash the script prints, and paste it into the
