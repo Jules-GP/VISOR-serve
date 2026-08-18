@@ -236,6 +236,46 @@ def _check_deployment_config(registry: dict) -> None:
             )
 
 
+
+class UnknownSupervisedCall(RuntimeError):
+    """A tool asks the supervisor for a tool this server does not serve."""
+
+
+def _check_supervised_calls(registry: dict) -> None:
+    """Every `sup.run("X", ...)` must name a tool this server carries.
+
+    FATAL, and deliberately so -- the same reasoning as a schema whose
+    source_hash no longer matches its source. Everything else discovery can go
+    wrong about costs one tool, which is skipped and reported; this one costs a
+    tool that starts, accepts a request, runs for an hour and THEN fails on a
+    name that was already wrong at deploy time. Refusing to start turns that
+    into a message before anyone sends a patient's scan.
+
+    It is the check that the free-standing call name was always missing. A tool
+    cannot import another -- separate virtualenvs are the reason the split
+    exists -- so the name has to be a string; what it lacked was anything
+    connecting that string to reality. Renaming ALI to ALI_CBCT/ALI_IOS broke
+    two callers, and neither said so until run time.
+    """
+    broken = {}
+    for name, tool in sorted(registry.items()):
+        for wanted in getattr(tool, "calls", ()):
+            if wanted not in registry:
+                broken.setdefault(name, []).append(wanted)
+    if not broken:
+        return
+
+    detail = "; ".join(
+        "{} calls {}".format(caller, ", ".join(sorted(missing)))
+        for caller, missing in sorted(broken.items())
+    )
+    raise UnknownSupervisedCall(
+        "These tools ask the supervisor for tools this server does not serve: "
+        "{}. Serving them would mean accepting requests that cannot finish. "
+        "Either deploy the missing tools, or fix the call name.".format(detail)
+    )
+
+
 def _build_registry() -> dict:
     registry: dict = {}
 
@@ -275,6 +315,7 @@ def _build_registry() -> dict:
         registry[instance.name] = instance
 
     _check_deployment_config(registry)
+    _check_supervised_calls(registry)
 
     logger.info(
         "Tool registry: %d loaded, %d of them from a schema (%s)",

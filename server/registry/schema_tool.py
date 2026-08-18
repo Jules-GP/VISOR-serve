@@ -142,6 +142,7 @@ OUTPUT_DIR_ARGUMENT = "output_dir"
 # as unknown, and so a deployment can be told which tools need siblings present.
 _TOP_LEVEL_KEYS = (
     "name", "description", "arguments", "returns", "source_hash", "supervisor",
+    "calls",
 )
 
 
@@ -471,6 +472,13 @@ class SchemaTool(Tool):
         # the same fact, published, so `/tools` can say a chain is involved and
         # a deployment check can verify the siblings are actually installed.
         self.needs_supervisor = bool(schema.get("supervisor"))
+        # The tools this one asks the supervisor for, as it declared them. A
+        # tool cannot import another -- separate virtualenvs are the reason the
+        # split exists -- so a call name is necessarily a free string, and this
+        # is what lets the registry check it names something real. Verified at
+        # startup, not here: it is a statement about the whole registry, and
+        # this object only knows itself.
+        self.calls = tuple(schema.get("calls") or ())
         self.arguments = {
             argument_name: _argument_spec(name, argument_name, declaration, deployment)
             for argument_name, declaration in arguments.items()

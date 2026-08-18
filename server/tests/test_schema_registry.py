@@ -418,3 +418,44 @@ def test_a_packaged_path_argument_accepts_the_tool_s_own_formats(make_tool_folde
 
     for filename in ("cohort.zip", "mesh.vtk", "measures.csv", "volume.nii.gz"):
         assert main._checked_extension(tool, "scan", filename), filename
+
+
+# ---------------------------------------------------------------------------
+# A supervised call must name a tool this server actually serves
+# ---------------------------------------------------------------------------
+
+def test_a_call_naming_a_missing_tool_stops_the_server(make_tool_folder, monkeypatch):
+    """Fatal, like a stale source_hash, and for the same reason.
+
+    Everything else discovery gets wrong costs one tool. This costs a tool that
+    starts, accepts a request, runs for an hour and THEN fails on a name that
+    was already wrong at deploy time -- which is what renaming ALI to
+    ALI_CBCT/ALI_IOS did to its two callers.
+    """
+    make_tool_folder("Caller", supervisor=True, calls=["NoSuchTool"])
+    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
+
+    with pytest.raises(registry.UnknownSupervisedCall, match="NoSuchTool"):
+        registry._build_registry()
+
+
+def test_a_call_naming_a_served_tool_is_accepted(make_tool_folder, monkeypatch):
+    """The other half: a chain whose members are all deployed starts."""
+    make_tool_folder("Caller", supervisor=True, calls=["Callee"])
+    make_tool_folder("Callee")
+    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
+
+    built = registry._build_registry()
+    # A subset check, not equality: the in-process Test_Tool and Example_Tool
+    # are always discovered too, and this test is about the chain.
+    assert {"Caller", "Callee"} <= set(built)
+    assert built["Caller"].calls == ("Callee",)
+
+
+def test_a_tool_declaring_no_calls_is_unaffected(make_tool_folder, monkeypatch):
+    """Absent is the normal case: most tools call nothing."""
+    make_tool_folder("Solo")
+    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
+
+    built = registry._build_registry()
+    assert built["Solo"].calls == ()
