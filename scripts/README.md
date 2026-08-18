@@ -10,6 +10,7 @@ model bundles around.
 | --- | --- |
 | [`setup-server.sh`](setup-server.sh) | Clone, check docker, start. One command from nothing. Runnable straight from GitHub. |
 | [`install-docker.sh`](install-docker.sh) | Docker Engine + compose plugin (+ the NVIDIA toolkit on request). Linux, needs root. |
+| [`install-docker-gpu.sh`](install-docker-gpu.sh) | The same from a bare Ubuntu, driver included: Docker, the NVIDIA driver if a card is present and unserved, then the container toolkit. |
 | [`server_ctl.py`](server_ctl.py) | The deployment engine: `status` / `up` / `update` / `down` / `logs` / `catalog` / `models`. |
 | [`setup-models.sh`](setup-models.sh) | Fetch AI models. Runnable straight from GitHub. |
 | [`setup-testfiles.sh`](setup-testfiles.sh) | Fetch reference test files. Runnable straight from GitHub. |
@@ -19,6 +20,33 @@ model bundles around.
 Everything here is **standard library only**, on purpose: it runs on a host
 before any `requirements.txt` is installed, and — for `server_ctl.py` — inside
 Slicer's own interpreter, where nothing may be pip-installed on a user's behalf.
+
+## What this folder does NOT do yet: put the tools on the machine
+
+Worth knowing before reading the rest. `setup-server.sh` and `server_ctl.py`
+start the `inference` (or `inference-cpu`) service, which mounts `./server` and
+serves whatever `TOOLS_DIR` points at — by default `server/tools/`, i.e. the two
+in-process demos. **The packaged tools are not fetched by anything here.**
+
+Today they reach a server one of two ways:
+
+- **the deployment image**, built with the tools as a named build context —
+  `TOOLS_CONTEXT=../sadt-tools/dist docker compose --profile venvs build
+  inference-venvs` (see [`docker/README.md`](../docker/README.md)). One image,
+  N virtualenvs, port 8001;
+- **a checkout**, for development — `./run-local.sh` with `SADT_TOOLS` pointing
+  at a `sadt-tools` clone, which sets `TOOLS_DIR` and `DESCRIBE_PATH` and
+  generates each schema at startup.
+
+Neither is `curl | sh`, and that is the gap. The intended answer is a
+`tools.lock` + volume bootstrap — tool folders fetched at pinned commit SHAs
+into `/srv/sadt/tools/<name>/revs/<sha>/` behind a `current` symlink, under a
+lock, provisioned by an entrypoint — so the image stays small, never rebuilds
+when a tool changes, and a rollback is a symlink move. Until that lands, a
+deployment stood up by these scripts serves `Test_Tool` and `Example_Tool`.
+
+`DATA/` is the half that IS handled: the model bundles and test files below are
+fetched independently of how the tools themselves arrive.
 
 ## Standing a server up
 
