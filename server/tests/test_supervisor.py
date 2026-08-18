@@ -212,7 +212,11 @@ def test_a_tool_calling_itself_is_stopped(tools_dir, tmp_path):
     )
 
     assert completed.returncode != 0
-    assert "nested more than" in completed.stderr
+    # Refused by NAME on the first call, not by the depth cap on the fifth:
+    # four processes and whatever each of them loaded are not spent finding out
+    # what the chain already says.
+    assert "Supervised call cycle" in completed.stderr
+    assert "Loop -> Loop" in completed.stderr
 
 
 def test_an_empty_optional_path_stays_empty(tools_dir, tmp_path):
@@ -238,3 +242,88 @@ def test_an_empty_optional_path_stays_empty(tools_dir, tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert Path(result["result"], "seen.txt").read_text() == "absent"
+
+
+# ---------------------------------------------------------------------------
+# parent / root, and the chain that refuses a cycle by name
+# ---------------------------------------------------------------------------
+
+def test_a_child_job_records_its_parent_and_its_root(tools_dir, tmp_path):
+    """Every nested job says which call made it and which request started it.
+
+    Not what makes nesting deadlock-free -- a nested call is a subprocess of its
+    parent and never re-enters the server's admission queue, so there is no
+    queue it could wait in. This is traceability, and the key a VRAM budget
+    would later be applied to.
+    """
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Parent", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call one child.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf")
+        return output_dir
+    """)
+
+    job_dir = tmp_path / "job"
+    completed, _ = run_job(
+        tools_dir, "Parent", job_dir,
+        {"scans": str(tmp_path / "in"), "output_dir": str(job_dir / "output")},
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    child_jobs = sorted(job_dir.glob("sup/*/job.json"))
+    assert len(child_jobs) == 1
+    record = json.loads(child_jobs[0].read_text(encoding="utf-8"))
+    assert record["parent"] == "t"
+    assert record["root"] == "t"
+    assert record["tool"] == "Leaf"
+
+
+def test_a_cycle_two_tools_long_is_named_not_counted(tools_dir, tmp_path):
+    """A -> B -> A is refused at the third call, naming all three.
+
+    The depth cap would also stop it, but only after five processes and
+    whatever each of them imported, and its message names a number rather than
+    the mistake.
+    """
+    make_tool(tools_dir, "Ping", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call Pong.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Pong", scans=scans, output_dir=sup.tmp / "pong")
+        return output_dir
+    """)
+    make_tool(tools_dir, "Pong", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call Ping back.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Ping", scans=scans, output_dir=sup.tmp / "ping")
+        return output_dir
+    """)
+
+    completed, _ = run_job(
+        tools_dir, "Ping", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+    )
+    assert completed.returncode != 0
+    assert "Supervised call cycle" in completed.stderr
+    assert "Ping -> Pong -> Ping" in completed.stderr
+
+
+def test_the_result_carries_no_vram_figure_when_the_tool_never_touched_torch(tools_dir, tmp_path):
+    """`sys.modules.get("torch")` and nothing else: a tabular tool pays nothing.
+
+    The absence IS the assertion. Importing torch to ask would cost seconds and
+    a CUDA context on every run of every tool that has no use for either.
+    """
+    make_tool(tools_dir, "Leaf", LEAF)
+    _, result = run_job(
+        tools_dir, "Leaf", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+    )
+    assert "result" in result
+    assert "peak_vram_bytes" not in result

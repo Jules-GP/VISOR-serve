@@ -6,9 +6,12 @@ interpreter, runner.py, result.json, and the cleanup around them. See
 conftest.py for how it is laid out.
 """
 
+import contextlib
 import json
 import os
 import sys
+import signal
+import time
 
 import pytest
 
@@ -159,7 +162,10 @@ def test_a_result_without_a_result_field_is_reported(probe_name, tmp_path):
 def test_the_timeout_kills_the_tool(probe_tool, probe_python, tracked_scratch_dirs, monkeypatch):
     monkeypatch.setattr(settings, "TOOL_TIMEOUT_SECONDS", 0.001)
 
-    with pytest.raises(dispatch.ToolExecutionError, match="TOOL_TIMEOUT_SECONDS"):
+    # The message names BOTH knobs now, the limit having become per-tool: which
+    # one applied is invisible from outside, and the operator's next move
+    # differs between them.
+    with pytest.raises(dispatch.ToolExecutionError, match="did not finish within its timeout"):
         dispatch.dispatch(probe_tool, {"a": 1, "b": 1})
 
 
@@ -223,3 +229,61 @@ def test_a_crashing_tool_is_a_500_that_says_nothing(
     assert response.status_code == 500
     assert response.json() == {"detail": "Tool execution failed."}
     assert set(os.listdir(settings.TEMP_DIR)) == before
+
+
+def test_the_timeout_kills_the_whole_process_group_not_just_the_tool(tmp_path):
+    """A grandchild that outlives its parent is killed too.
+
+    This is the entire reason `start_new_session` + `killpg` replaced a bare
+    `subprocess.run(timeout=...)`. That kills the one PID it knows about, and
+    every heavy tool here forks workers -- nnUNet, torch's DataLoader, shapeaxi.
+    An orphaned worker keeps its CUDA context, so the card stays full after the
+    job that filled it is gone, with nothing left to attribute it to.
+
+    Deliberately at the level of `_execute` rather than through `dispatch()`:
+    the probe's signature and its `source_hash` are pinned by other tests, so
+    giving it a "fork and hang" mode to exercise this would change what those
+    tests describe.
+    """
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    pid_file = job_dir / "grandchild.pid"
+
+    # Spawn a grandchild that would happily outlive us, publish its pid, hang.
+    program = (
+        "import os, subprocess, sys, time;"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']);"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid));"
+        "time.sleep(300)"
+    )
+
+    with pytest.raises(dispatch.ToolExecutionError, match="did not finish within its timeout"):
+        dispatch._execute(
+            [sys.executable, "-c", program],
+            str(job_dir),
+            dict(os.environ),
+            timeout=2.0,
+            tool_name="Probe",
+        )
+
+    assert pid_file.is_file(), "the grandchild never started, so this proves nothing"
+    grandchild = int(pid_file.read_text())
+
+    # `os.kill(pid, 0)` is the liveness probe: it signals nothing and raises
+    # ProcessLookupError once the pid is gone. The grandchild is orphaned rather
+    # than ours, so it is reaped by init and never lingers as a zombie -- which
+    # is what makes this check meaningful rather than racing a defunct entry.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+
+    # Still alive: clean up so the suite does not leak a 300s sleeper, then fail.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(grandchild, signal.SIGKILL)
+    pytest.fail(
+        f"grandchild {grandchild} survived the timeout: killpg did not reach the process group"
+    )

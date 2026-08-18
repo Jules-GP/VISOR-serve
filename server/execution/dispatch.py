@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import threading
 import uuid
@@ -36,11 +37,15 @@ from typing import Any, Optional
 import file_utils
 from base import ToolUnavailableError
 from config import settings
+from registry.deployment import deployment_config
 
 logger = logging.getLogger("inference_server")
 
 JOB_FILE = "job.json"
 RESULT_FILE = "result.json"
+# How long a TERMed process group gets before SIGKILL.
+_KILL_GRACE_SECONDS = 10.0
+
 STDOUT_LOG = "stdout.log"
 STDERR_LOG = "stderr.log"
 
@@ -257,20 +262,28 @@ def _stderr_tail(job_dir: str) -> str:
     return tail.decode("utf-8", errors="replace").strip() or "(empty stderr)"
 
 
-def _execute(command: list, job_dir: str, environment: dict) -> int:
+def _execute(command: list, job_dir: str, environment: dict, timeout: Optional[float],
+             tool_name: str = "") -> int:
     """Run the tool process to completion; return its exit code.
 
     stdout and stderr go to FILES, not to pipes: a tool can print for hours
     (nnUNet does), and a pipe means holding all of it in the server's memory.
     Their contents are never logged either -- shapeaxi prints the patient's own
     file name.
+
+    The process gets its own SESSION (`start_new_session`), and a timeout kills
+    the whole PROCESS GROUP rather than the one PID we know about. That
+    distinction is the entire point: nnUNet, torch's DataLoader and shapeaxi all
+    fork workers, and killing the parent leaves those workers running and
+    holding VRAM -- a card that stays full after the job that filled it is gone,
+    with nothing left to attribute it to. `killpg` reaches them because the
+    session made them one group.
     """
-    timeout = settings.TOOL_TIMEOUT_SECONDS or None
     with open(os.path.join(job_dir, STDOUT_LOG), "wb") as out_stream, open(
         os.path.join(job_dir, STDERR_LOG), "wb"
     ) as error_stream:
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 stdout=out_stream,
                 stderr=error_stream,
@@ -278,17 +291,57 @@ def _execute(command: list, job_dir: str, environment: dict) -> int:
                 # A tool writing a relative path lands in its own job directory
                 # rather than in the server's source tree.
                 cwd=job_dir,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            # subprocess.run has already killed it and reaped it.
-            raise ToolExecutionError(
-                f"The tool did not finish within TOOL_TIMEOUT_SECONDS ({timeout}s)."
+                # POSIX only, which the deployment image is. On Windows this
+                # would need CREATE_NEW_PROCESS_GROUP and a different kill.
+                start_new_session=True,
             )
         except OSError as exc:
             raise ToolExecutionError(f"Could not start the tool process: {exc}")
-    return completed.returncode
+
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(process)
+            # Naming both knobs, because which one applied is not visible from
+            # the outside and the operator's next move differs: a per-tool entry
+            # raises it for this tool alone, the global setting for everything.
+            raise ToolExecutionError(
+                f"Tool '{tool_name}' did not finish within its timeout ({timeout}s). "
+                f"Raise it with [tools.{tool_name}] timeout_seconds in deployment.toml, "
+                f"or TOOL_TIMEOUT_SECONDS for every tool."
+            )
+
+
+def _kill_group(process: subprocess.Popen) -> None:
+    """SIGTERM the process group, then SIGKILL whatever is left.
+
+    TERM first so a tool with a handler can release the card and flush; KILL
+    after a grace period because most will not. `os.killpg` needs the group id,
+    which is the child's pid precisely because `start_new_session` made it a
+    group leader.
+
+    Every failure here is swallowed deliberately: the process may have exited
+    between the timeout and the signal, and a ProcessLookupError then is the
+    normal case, not an error to propagate over a timeout that already is one.
+    """
+    for signal_number, grace in ((signal.SIGTERM, _KILL_GRACE_SECONDS), (signal.SIGKILL, None)):
+        try:
+            os.killpg(os.getpgid(process.pid), signal_number)
+        except (ProcessLookupError, PermissionError, OSError):
+            break
+        if grace is None:
+            break
+        try:
+            process.wait(timeout=grace)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        process.wait(timeout=_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        # Unreapable after SIGKILL means the process is stuck in the kernel
+        # (uninterruptible I/O). Nothing further is possible from here.
+        logger.error("Tool process %s survived SIGKILL; it is now a zombie.", process.pid)
 
 
 def _read_result(job_dir: str, tool_name: str) -> Any:
@@ -341,15 +394,18 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
         job_path = _write_job_file(job_dir, job_id, tool.name, params)
         command = [interpreter, runner, "--job", job_path]
         environment = _child_environment(job_id, job_dir)
+        # Per tool, falling back to the global setting. 0 means no limit, which
+        # a cohort legitimately needs.
+        timeout = deployment_config.timeout_seconds(tool.name) or None
 
         if uses_the_gpu(tool, params):
             # Held for the whole run, and released by leaving the block on any
             # path. Blocking on purpose: the request already waits for the tool,
             # and a queue is what a single card wants.
             with _gpu_semaphore():
-                exit_code = _execute(command, job_dir, environment)
+                exit_code = _execute(command, job_dir, environment, timeout, tool.name)
         else:
-            exit_code = _execute(command, job_dir, environment)
+            exit_code = _execute(command, job_dir, environment, timeout, tool.name)
 
         if exit_code != 0:
             # A tool that recorded WHICH exception it was gets to say so; the

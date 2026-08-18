@@ -33,3 +33,6 @@ DATA/
 
 # run-local.sh writes here.
 local-server.log
+
+# Scratch from manual validation runs (landmark comparisons, resolve probes).
+.validation/

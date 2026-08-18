@@ -41,7 +41,7 @@ logger = logging.getLogger("inference_server")
 # The two kinds data_store.py serves (DATA_DIR/<tool>/{models,testfiles}/).
 SERVER_SELECTABLE_KINDS = ("model", "testfile")
 
-_TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden")
+_TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden", "timeout_seconds")
 
 
 class DeploymentConfigError(Exception):
@@ -70,6 +70,15 @@ class ToolDeployment:
     # business being asked. A deployment decision, which is why it lives here
     # and not in the tool: the tool knows nothing about who is looking at it.
     hidden: tuple = ()
+
+    # How long this tool may run before it is killed, in seconds. None falls
+    # back to settings.TOOL_TIMEOUT_SECONDS, and 0 there means "no limit".
+    #
+    # Per tool rather than global because the right number differs by two orders
+    # of magnitude: a SurgMovPred prediction is seconds, an AMASSS cohort is
+    # hours. One global value has to be set for the slowest tool, which means
+    # every fast tool that hangs holds a slot until then.
+    timeout_seconds: Optional[float] = None
 
 
 _NOTHING_DECLARED = ToolDeployment()
@@ -106,6 +115,17 @@ class DeploymentConfig:
         global MAX_UPLOAD_MB is the default, not a ceiling."""
         limit = self.for_tool(tool_name).max_upload_mb
         return settings.MAX_UPLOAD_MB if limit is None else limit
+
+    def timeout_seconds(self, tool_name: str) -> float:
+        """How long this tool may run, in seconds; 0 means no limit.
+
+        Per-tool config wins, and the global TOOL_TIMEOUT_SECONDS is the
+        default rather than a ceiling -- an AMASSS cohort legitimately runs
+        longer than anything else here, and capping it at whatever suits
+        SurgMovPred would kill real work.
+        """
+        declared = self.for_tool(tool_name).timeout_seconds
+        return settings.TOOL_TIMEOUT_SECONDS if declared is None else declared
 
 
 def _tool_deployment(tool_name: str, table) -> ToolDeployment:
@@ -150,11 +170,20 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
             f"{where}: 'hidden' must be a list of argument names."
         )
 
+    timeout = table.get("timeout_seconds")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0
+    ):
+        raise DeploymentConfigError(
+            f"{where}: 'timeout_seconds' must be a non-negative number (0 means no limit)."
+        )
+
     return ToolDeployment(
         server_selectable=dict(selectable),
         max_upload_mb=limit,
         data_dir=data_dir,
         hidden=tuple(hidden),
+        timeout_seconds=float(timeout) if timeout is not None else None,
     )
 
 

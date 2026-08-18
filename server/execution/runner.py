@@ -59,10 +59,16 @@ JOB_FILE = "job.json"
 # client never sends one, because it is not data.
 SUPERVISOR_ARGUMENT = "sup"
 
-# Guards a tool that names itself, directly or through a cycle. Four is past
-# anything real: the deepest chain today is AREG -> ASO -> ALI.
+# Guards a tool that names itself, directly or through a cycle. Five is past
+# anything real: the deepest chain today is AREG_IOSCBCT -> ASO -> ALI_CBCT.
 SUPERVISOR_DEPTH_ENV = "SADT_SUPERVISOR_DEPTH"
-MAX_SUPERVISOR_DEPTH = 4
+MAX_SUPERVISOR_DEPTH = 5
+
+# The tools already on the stack, innermost last, as one comma-separated value.
+# It travels in the environment rather than in job.json because it belongs to
+# the CALL, not to the job: the same tool run directly and run as a child reads
+# a different chain, and job.json is what a caller writes.
+SUPERVISOR_CHAIN_ENV = "SADT_SUPERVISOR_CHAIN"
 
 # The tool's package under src/, when there is exactly one. sadt-tools names it
 # `sadt_<tool>`, but the rule is the one its own describe.py uses -- the single
@@ -229,6 +235,30 @@ def _jsonable(value):
     )
 
 
+def _peak_vram_bytes():
+    """Peak CUDA memory this process allocated, or None.
+
+    `sys.modules.get` rather than an import: a tool that never touched torch
+    stays untouched, and importing it here would cost seconds and a CUDA
+    context on every tabular run. If torch is not in sys.modules, the tool did
+    not use it, by definition.
+
+    Every failure is swallowed on purpose. This is instrumentation -- it exists
+    so a real VRAM budget can be set later from measurements instead of
+    guesses -- and instrumentation must never be able to fail a run that
+    otherwise succeeded.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.max_memory_allocated())
+    except Exception:  # noqa: BLE001 - see above
+        return None
+
+
 def _write_result(job_dir: str, result) -> None:
     """Write {"result": ...} atomically.
 
@@ -236,7 +266,11 @@ def _write_result(job_dir: str, result) -> None:
     result is a clean failure rather than a truncated result.json; and replaced
     into place, so the server never reads one being written.
     """
-    payload = json.dumps({"result": result}, default=_jsonable)
+    body = {"result": result}
+    peak = _peak_vram_bytes()
+    if peak is not None:
+        body["peak_vram_bytes"] = peak
+    payload = json.dumps(body, default=_jsonable)
     final_path = os.path.join(job_dir, RESULT_FILE)
     temp_path = final_path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
@@ -323,10 +357,21 @@ class _Supervisor:
     running several supervised jobs concurrently has to size for that.
     """
 
-    def __init__(self, tools_dir: str, job_dir: str, depth: int):
+    def __init__(self, tools_dir: str, job_dir: str, depth: int, chain=(), job_id=None, root=None):
         self._tools_dir = tools_dir
         self._job_dir = job_dir
         self._depth = depth
+        # Innermost last. `chain` is what refuses a cycle by NAME; `depth` is
+        # only a backstop for a chain that grows without repeating.
+        self._chain = tuple(chain)
+        self._job_id = job_id
+        # The job at the top of this tree. Carried so every record in a
+        # supervised run can be attributed to the request that started it --
+        # traceability, and what a VRAM budget would later be applied to. It is
+        # NOT what makes nesting deadlock-free: a nested call is a subprocess of
+        # its parent and never re-enters the server's admission queue at all,
+        # so there is no queue it could wait in.
+        self._root = root or job_id
         self._calls = 0
         self.out = Path(job_dir) / "output"
         # Removed with the job directory, by whoever owns it. The tool is held
@@ -339,11 +384,20 @@ class _Supervisor:
 
     def run(self, tool: str, **params):
         """Run another tool, blocking, and return what its run() returned."""
+        # Checked BEFORE the depth cap, because it is the more precise answer to
+        # the same question. A cycle hits the depth limit eventually anyway, but
+        # only after starting four processes and whatever they each loaded, and
+        # the message it produces names a number rather than the mistake.
+        if tool in self._chain:
+            raise RunnerError(
+                "Supervised call cycle: {} -> {}. A tool cannot call one that is "
+                "already running above it.".format(" -> ".join(self._chain), tool)
+            )
         if self._depth >= MAX_SUPERVISOR_DEPTH:
             raise RunnerError(
-                f"Supervised calls nested more than {MAX_SUPERVISOR_DEPTH} deep "
-                f"(asking for '{tool}'). A tool is calling itself, directly or "
-                f"through a cycle."
+                "Supervised calls nested more than {} deep ({} -> {}).".format(
+                    MAX_SUPERVISOR_DEPTH, " -> ".join(self._chain), tool
+                )
             )
 
         interpreter = self._interpreter(tool)
@@ -351,14 +405,17 @@ class _Supervisor:
         nested_dir = os.path.join(self._job_dir, "sup", f"{self._calls:02d}_{tool}")
         os.makedirs(os.path.join(nested_dir, "output"), exist_ok=True)
 
+        child_id = f"{os.path.basename(self._job_dir)}.{self._calls}"
         job_path = os.path.join(nested_dir, JOB_FILE)
         with open(job_path, "w", encoding="utf-8") as handle:
             json.dump(
                 {
-                    "job_id": f"{os.path.basename(self._job_dir)}.{self._calls}",
+                    "job_id": child_id,
                     "tool": tool,
                     "job_dir": nested_dir,
                     "params": params,
+                    "parent": self._job_id,
+                    "root": self._root,
                 },
                 handle,
                 default=_jsonable,
@@ -367,6 +424,7 @@ class _Supervisor:
         self.log(f"running '{tool}'")
         environment = dict(os.environ)
         environment[SUPERVISOR_DEPTH_ENV] = str(self._depth + 1)
+        environment[SUPERVISOR_CHAIN_ENV] = ",".join(self._chain + (tool,))
         # SADT_TOOL_DIR points at the PARENT's folder; the callee derives its
         # own from its interpreter, and inheriting ours would send it to the
         # wrong sources.
@@ -457,7 +515,21 @@ def _supervisor_for(run, job: dict):
         depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0"))
     except ValueError:
         pass
-    return _Supervisor(tools_dir=tools_dir, job_dir=job["job_dir"], depth=depth)
+    # The chain the parent handed us, plus ourselves. A root job has an empty
+    # environment variable and a chain of just its own name, which is what makes
+    # a tool calling ITSELF the first thing refused rather than the fifth.
+    inherited = tuple(
+        name for name in os.environ.get(SUPERVISOR_CHAIN_ENV, "").split(",") if name
+    )
+    chain = inherited or (job["tool"],)
+    return _Supervisor(
+        tools_dir=tools_dir,
+        job_dir=job["job_dir"],
+        depth=depth,
+        chain=chain,
+        job_id=job.get("job_id"),
+        root=job.get("root"),
+    )
 
 
 def _load_job(job_path: str) -> dict:
