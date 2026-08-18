@@ -252,6 +252,29 @@ def _print_report(report: ParityReport, imported: RunSnapshot, packaged: RunSnap
         )
 
 
+
+def _packaged_folder(name: str) -> str:
+    """`<TOOLS_DIR>/<name>`, or `<TOOLS_DIR>/<group>/<name>` when it is nested.
+
+    The fifth place this flat-depth assumption was found. Harmless here in a way
+    it was not elsewhere -- this is a command-line comparison tool, and
+    `--packaged` already lets a caller name the folder outright -- but leaving
+    one site behind is how the assumption survived three rounds of fixing it.
+    """
+    direct = os.path.join(settings.TOOLS_DIR, name)
+    if os.path.isdir(direct):
+        return direct
+    try:
+        groups = sorted(os.listdir(settings.TOOLS_DIR))
+    except OSError:
+        return direct
+    for group in groups:
+        nested = os.path.join(settings.TOOLS_DIR, group, name)
+        if os.path.isdir(nested):
+            return nested
+    return direct
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--imported", required=True, help="Folder name under server/tools/")
@@ -276,9 +299,7 @@ def main(argv=None) -> int:
     imported_folder = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "tools", arguments.imported
     )
-    packaged_folder = os.path.join(
-        settings.TOOLS_DIR, arguments.packaged or arguments.imported.lower()
-    )
+    packaged_folder = _packaged_folder(arguments.packaged or arguments.imported.lower())
     ignored = tuple(DEFAULT_IGNORED_KEYS) + tuple(arguments.ignore)
 
     with open(arguments.args) as handle:

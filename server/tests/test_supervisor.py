@@ -358,3 +358,43 @@ def test_a_supervised_tool_is_found_inside_a_grouping_folder(tools_dir, tmp_path
         {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_a_nested_tool_can_call_a_tool_outside_its_group(tools_dir, tmp_path):
+    """The caller may itself live under a grouping folder.
+
+    `_tool_dir()` gives the caller's own folder and the tools root was taken as
+    its parent -- correct for tools/AMASSS, wrong for tools/ALI/ALI_CBCT, where
+    the parent is the group and its siblings would be the only tools reachable.
+    Latent while nested tools call nothing; AREG_IOSCBCT is a nested tool whose
+    whole job is calling the others.
+    """
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call a tool that sits OUTSIDE this tool's group.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf")
+        return output_dir
+    """)
+    # Move only the CALLER under a group; Leaf stays at the top level.
+    group = tools_dir / "Group"
+    group.mkdir()
+    (tools_dir / "Caller").rename(group / "Caller")
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "output").mkdir(exist_ok=True)
+    job_path = job_dir / "job.json"
+    job_path.write_text(json.dumps({
+        "job_id": "t", "tool": "Caller", "job_dir": str(job_dir),
+        "params": {"scans": str(tmp_path / "in"),
+                   "output_dir": str(job_dir / "output")},
+    }), encoding="utf-8")
+    completed = subprocess.run(
+        [str(group / "Caller" / ".venv" / "bin" / "python"), str(RUNNER),
+         "--job", str(job_path)],
+        capture_output=True, text=True, cwd=str(job_dir),
+    )
+    assert completed.returncode == 0, completed.stderr

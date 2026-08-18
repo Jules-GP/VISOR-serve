@@ -32,6 +32,11 @@ described is skipped.
 import importlib
 import logging
 import os
+
+try:  # tomllib is standard from 3.11; the server targets the newest Python
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only on 3.10 and older
+    import tomli as tomllib
 import traceback
 
 try:
@@ -85,21 +90,101 @@ def _record_failure(folder: str, exc: Exception) -> None:
     )
 
 
-def _tool_folders(root: str) -> list:
-    """Candidate tool folders directly under `root`, in a stable order.
+# What marks a directory as a tool, and where its API name is declared.
+#
+#     [tool.sadt]
+#     tool = true
+#     name = "Crown_Seg"
+#
+# Keyed on the SECTION rather than on the presence of a pyproject.toml, because
+# a shared path dependency has one too and must not be served: tools/ALI/common/
+# holds the markups writer both ALI engines import, and testkit is installed
+# into every tool's dev environment. Both are importable packages, neither is a
+# tool.
+SADT_SECTION = "sadt"
+SADT_NAME_KEY = "name"
+PYPROJECT = "pyproject.toml"
 
-    A leading underscore or dot excludes a folder from discovery, which is how
-    a fixture like tools/_dispatch_probe/ stays out of GET /tools.
+# How deep discovery walks below TOOLS_DIR. 2 covers a grouping folder
+# (tools/ALI/ALI_CBCT); deeper would start descending into a tool's own vendored
+# directories, and a tool is never nested inside another tool.
+MAX_TOOL_DEPTH = 2
+
+
+def _declares_tool(folder: str):
+    """`(True, declared name or None)` when this folder's pyproject says so.
+
+    A pyproject that cannot be parsed is reported and skipped rather than
+    raising: it costs one tool, like every other discovery failure, and taking
+    the server down for a malformed file in one folder would be out of
+    proportion. The one failure that IS fatal stays the stale source_hash.
+    """
+    path = os.path.join(folder, PYPROJECT)
+    if not os.path.isfile(path):
+        return False, None
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, ValueError) as exc:
+        _record_failure(os.path.basename(folder), exc)
+        return False, None
+    section = (data.get("tool") or {}).get(SADT_SECTION)
+    if not isinstance(section, dict) or not section.get("tool"):
+        return False, None
+    declared = section.get(SADT_NAME_KEY)
+    return True, declared if isinstance(declared, str) and declared.strip() else None
+
+
+def _tool_folders(root: str) -> list:
+    """`(api name, folder path)` for every tool under `root`, in a stable order.
+
+    Walked to MAX_TOOL_DEPTH rather than listed one level deep: ALI_CBCT and
+    ALI_IOS are two tools inside tools/ALI/, which holds no tool of its own.
+    Discovery does NOT descend into a folder that is already a tool.
+
+    The API name comes from `[tool.sadt] name` when declared, and falls back to
+    the directory name otherwise. That fallback is what keeps every tool that
+    predates the key working; a new tool should declare it, so its API identity
+    is a decision rather than an accident of directory casing.
+
+    A leading underscore or dot still excludes a folder, which is how
+    tools/_dispatch_probe/ stays out of GET /tools while remaining a usable
+    fixture.
     """
     if not os.path.isdir(root):
         return []
-    return [
-        entry
-        for entry in sorted(os.listdir(root))
-        if os.path.isdir(os.path.join(root, entry))
-        and not entry.startswith("_")
-        and not entry.startswith(".")
-    ]
+
+    found = []
+
+    def walk(directory: str, depth: int) -> None:
+        try:
+            entries = sorted(os.listdir(directory))
+        except OSError as exc:
+            _record_failure(os.path.basename(directory), exc)
+            return
+        for entry in entries:
+            if entry.startswith("_") or entry.startswith("."):
+                continue
+            path = os.path.join(directory, entry)
+            if not os.path.isdir(path):
+                continue
+            is_tool, declared = _declares_tool(path)
+            if is_tool:
+                # Not descended into: a tool is never nested inside another.
+                found.append((declared or entry, path))
+                continue
+            if depth == 1:
+                # A folder directly under TOOLS_DIR with no `[tool.sadt]` is
+                # still a candidate: that is where an IN-PROCESS tool lives, a
+                # `<name>.py` defining a Tool subclass, which has no pyproject at
+                # all. `[tool.sadt]` is what a PACKAGED tool declares, and the
+                # two kinds are told apart further down by is_packaged().
+                found.append((entry, path))
+            if depth < MAX_TOOL_DEPTH:
+                walk(path, depth + 1)
+
+    walk(root, 1)
+    return sorted(found)
 
 
 def _is_leftover(folder: str) -> bool:
@@ -131,14 +216,13 @@ def _discover_schema_tools(root: str) -> list:
     re-raised -- it is the one failure that takes the server with it.
     """
     discovered = []
-    for entry in _tool_folders(root):
-        folder = os.path.join(root, entry)
+    for name, folder in _tool_folders(root):
         if not is_packaged(folder):
             continue
         try:
-            discovered.append((entry, load_tool(folder, deployment_config)))
+            discovered.append((name, load_tool(folder, deployment_config, name=name)))
         except Exception as exc:
-            _record_failure(entry, exc)
+            _record_failure(name, exc)
     return discovered
 
 
@@ -153,8 +237,7 @@ def _discover_tool_classes(root: str) -> list:
     if tools_package is None:
         return discovered
 
-    for entry in _tool_folders(root):
-        folder_path = os.path.join(root, entry)
+    for entry, folder_path in _tool_folders(root):
         # A tool that declares a schema is served from it and never imported.
         if is_packaged(folder_path):
             continue

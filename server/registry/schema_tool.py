@@ -522,7 +522,7 @@ class SchemaTool(Tool):
         )
 
 
-def load_tool(folder: str, config) -> SchemaTool:
+def load_tool(folder: str, config, name: str = None) -> SchemaTool:
     """Build the tool declared by `folder`, after checking its schema is the
     one its source produced.
 
@@ -533,15 +533,36 @@ def load_tool(folder: str, config) -> SchemaTool:
     """
     schema = resolve_schema(folder)
 
-    name = schema.get("name")
-    if isinstance(name, str) and name and name != os.path.basename(folder.rstrip(os.sep)):
-        # Not cosmetic: dispatch.py finds the interpreter at
-        # <TOOLS_DIR>/<tool name>/.venv/bin/python, so a folder named anything
-        # else is a tool that registers and then cannot be run.
+    # The API name, in order: what the registry read from `[tool.sadt] name`,
+    # then what the schema says, then the folder. Declaring it is what lets a
+    # folder move -- under a grouping folder, say -- without the name a client
+    # sends moving with it.
+    folder_name = os.path.basename(folder.rstrip(os.sep))
+    schema_name = schema.get("name")
+    name = name or (schema_name if isinstance(schema_name, str) and schema_name else folder_name)
+
+    if isinstance(schema_name, str) and schema_name and schema_name != name:
+        # The schema is generated from the source; `[tool.sadt] name` is the
+        # declared API identity. They describe the same tool, so a disagreement
+        # is a mistake in one of them, and guessing which would publish a name
+        # nobody chose.
         raise SchemaError(
-            f"Tool '{name}' is installed in a folder named "
-            f"'{os.path.basename(folder.rstrip(os.sep))}'. The folder must be named after the "
-            f"tool: its interpreter is looked up by tool name."
+            f"Folder '{folder_name}' declares the tool name '{name}' in its pyproject "
+            f"but its schema says '{schema_name}'. Regenerate the schema, or fix "
+            f"[tool.sadt] name."
+        )
+
+    if name != folder_name:
+        # Still required, and `[tool.sadt] name` does not relax it: the
+        # interpreter is looked up at <TOOLS_DIR>/[<group>/]<tool name>/.venv, so
+        # a folder named anything else registers a tool that cannot be run. What
+        # declaring the name buys is that the DEPTH may change -- a tool can move
+        # under a grouping folder -- and that renaming the folder without meaning
+        # to change the API name now fails here instead of silently renaming the
+        # tool a client asks for.
+        raise SchemaError(
+            f"Tool '{name}' is installed in a folder named '{folder_name}'. The folder "
+            f"must be named after the tool: its interpreter is looked up by tool name."
         )
 
     arguments = schema.get("arguments") or {}

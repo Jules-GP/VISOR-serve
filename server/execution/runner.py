@@ -498,18 +498,41 @@ class _Supervisor:
         )
 
     def _candidate_folders(self, tool: str):
-        """`<tools>/<tool>` first, then `<tools>/*/<tool>`."""
-        yield os.path.join(self._tools_dir, tool)
-        try:
-            groups = sorted(os.listdir(self._tools_dir))
-        except OSError:
-            return
-        for group in groups:
-            if group == tool:
+        """`<root>/<tool>` then `<root>/*/<tool>`, for each root we might be under.
+
+        Two roots, because the CALLER may itself be nested. `_tool_dir()` gives
+        this tool's folder and the root was taken as its parent -- right for
+        tools/AMASSS, wrong for tools/ALI/ALI_CBCT, where the parent is the
+        grouping folder and its siblings are the only tools reachable. That is
+        latent today, ALI_CBCT calling nothing, and it points straight at
+        AREG_IOSCBCT: a nested tool whose whole job is calling the others.
+        """
+        seen = set()
+        for root in self._roots:
+            direct = os.path.join(root, tool)
+            if direct not in seen:
+                seen.add(direct)
+                yield direct
+            try:
+                groups = sorted(os.listdir(root))
+            except OSError:
                 continue
-            nested = os.path.join(self._tools_dir, group, tool)
-            if os.path.isdir(nested):
-                yield nested
+            for group in groups:
+                if group == tool:
+                    continue
+                nested = os.path.join(root, group, tool)
+                if nested not in seen and os.path.isdir(nested):
+                    seen.add(nested)
+                    yield nested
+
+    @property
+    def _roots(self):
+        """The tools directory, and its parent when we are a nested tool."""
+        roots = [self._tools_dir]
+        parent = os.path.dirname(self._tools_dir)
+        if parent and parent != self._tools_dir:
+            roots.append(parent)
+        return roots
 
     def _result(self, tool: str, nested_dir: str):
         path = os.path.join(nested_dir, RESULT_FILE)

@@ -130,8 +130,30 @@ class ToolExecutionError(RuntimeError):
 
 
 def tool_interpreter(tool_name: str) -> str:
-    """Path to the interpreter of this tool's virtualenv."""
-    return os.path.join(settings.TOOLS_DIR, tool_name, ".venv", "bin", "python")
+    """Path to the interpreter of this tool's virtualenv.
+
+    Searched one level below TOOLS_DIR as well as directly under it, because a
+    tool may live inside a GROUPING folder: ALI_CBCT and ALI_IOS are two tools
+    in tools/ALI/, which is not a tool itself. The folder is still named after
+    the tool -- only its depth varies -- so this stays a lookup.
+
+    The direct path is returned when nothing matches, so the caller's error
+    names where it looked first.
+    """
+    direct = os.path.join(settings.TOOLS_DIR, tool_name, ".venv", "bin", "python")
+    if os.path.isfile(direct):
+        return direct
+    try:
+        groups = sorted(os.listdir(settings.TOOLS_DIR))
+    except OSError:
+        return direct
+    for group in groups:
+        if group == tool_name:
+            continue
+        nested = os.path.join(settings.TOOLS_DIR, group, tool_name, ".venv", "bin", "python")
+        if os.path.isfile(nested):
+            return nested
+    return direct
 
 
 def _checked_interpreter(tool_name: str) -> str:
