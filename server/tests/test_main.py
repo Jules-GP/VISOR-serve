@@ -416,7 +416,11 @@ def test_surface_file_type_accepts_every_mesh_format_it_advertises(monkeypatch):
             files={"mesh": (f"scan{extension}", io.BytesIO(b"mesh bytes"), "application/octet-stream")},
         )
         assert response.status_code == 200, extension
-        assert response.json() == {"result": f"mesh{extension}"}
+        # `mesh_scan`, not `mesh`: the field name, then the sanitized stem
+        # of what was uploaded. The extension is what this test is about
+        # and is unchanged; the stem is there so a batch's outputs can be
+        # told apart, every tool here naming its outputs after its input.
+        assert response.json() == {"result": f"mesh_scan{extension}"}
 
     response = client.post(
         "/run/surface_test_tool",
@@ -1398,3 +1402,87 @@ def test_a_single_named_output_is_streamed(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert response.content == b"segmentation"
+
+
+# ---------------------------------------------------------------------------
+# A patient's filename survives into the output
+# ---------------------------------------------------------------------------
+
+def test_an_uploaded_filename_reaches_the_tool_that_names_its_outputs_from_it(
+    tmp_path, monkeypatch
+):
+    """The property that matters clinically: which output belongs to which patient.
+
+    Not "the sanitizer produces string X" -- that is an implementation. The
+    thing a clinician depends on is that a batch of scans comes back as a batch
+    of distinguishable results, and every tool here names its outputs after its
+    input, so this is the one place that can be true or false for all of them.
+
+    Before this, the temp file was named after the FORM FIELD, so every patient
+    arrived as `scans.nii.gz` and every result came back as
+    `scans_Pred_MAND.nii.gz`. Identity survived only in request order. Measured
+    on AMASSS, Batch_Dental_Seg and Crown_Seg -- three unrelated code families,
+    one cause.
+    """
+    seen = {}
+
+    class _Spy(Tool):
+        name = "Spy_Tool"
+        arguments = {"scan": ArgSpec(type="nifti_file", required=True)}
+        output_kind = "text"
+
+        def run(self, scan):
+            # What the tool sees is what it will name its outputs after.
+            seen["path"] = str(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Spy_Tool", _Spy())
+
+    source = tmp_path / "patient 042 (T1).nii.gz"
+    source.write_bytes(b"not a real volume")
+    with open(source, "rb") as handle:
+        response = client.post(
+            "/run/Spy_Tool",
+            files={"scan": ("patient 042 (T1).nii.gz", handle, "application/gzip")},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 200, response.text
+    received = os.path.basename(seen["path"])
+    # Recognisable, not identical: the spaces and parentheses are gone because
+    # this string is written to the server's disk.
+    assert "042" in received, received
+    assert "patient" in received, received
+    assert received.endswith(".nii.gz"), received
+    # And the argument it belongs to is still readable.
+    assert received.startswith("scan_"), received
+
+
+def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkeypatch):
+    """The reason the name is sanitized rather than trusted."""
+    seen = {}
+
+    class _Spy(Tool):
+        name = "Spy_Tool_2"
+        arguments = {"scan": ArgSpec(type="nifti_file", required=True)}
+        output_kind = "text"
+
+        def run(self, scan):
+            seen["path"] = str(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Spy_Tool_2", _Spy())
+
+    source = tmp_path / "evil.nii.gz"
+    source.write_bytes(b"x")
+    with open(source, "rb") as handle:
+        response = client.post(
+            "/run/Spy_Tool_2",
+            files={"scan": ("../../../etc/passwd.nii.gz", handle, "application/gzip")},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 200, response.text
+    received = seen["path"]
+    assert ".." not in received, received
+    assert os.path.basename(received).startswith("scan_"), received

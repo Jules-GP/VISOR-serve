@@ -11,6 +11,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -655,6 +656,50 @@ def _upload_references(raw) -> dict:
     return references
 
 
+
+# Characters kept from a client-supplied filename. Everything else is dropped
+# rather than escaped: this string becomes a path component on the server's
+# disk, and a whitelist is the only form of that decision which cannot be
+# reasoned around.
+_SAFE_STEM = re.compile(r"[^A-Za-z0-9_.-]+")
+# How much of the name survives. Long enough for a real patient identifier,
+# short enough that it cannot push the path past a filesystem limit.
+_MAX_STEM = 64
+
+
+def _safe_stem(filename: str, extension: str) -> str:
+    """The patient-identifying part of an upload's name, made safe to write.
+
+    Sanitized, NOT discarded, and the distinction is clinical. Naming the temp
+    file after the form field alone -- which is what this replaces -- meant every
+    scan in a batch arrived as `scans.nii.gz`, so every tool that names its
+    outputs after its input handed back `scans_Pred_MAND.nii.gz` for every
+    patient. Identity survived only in the order the requests were made. Measured
+    on three unrelated tools (AMASSS, Batch_Dental_Seg, Crown_Seg) before being
+    fixed here, once, where the name is chosen.
+
+    The real risk was never the name's presence, it is writing an unsanitized
+    client string to disk. So:
+
+    - the declared extension is removed first, not `Path.stem`, which only strips
+      the last suffix and would leave `.nii` on a `.nii.gz`;
+    - everything outside `[A-Za-z0-9_.-]` is dropped, which removes separators
+      and control characters outright;
+    - leading dots go, so nothing becomes a hidden file or a relative path;
+    - a result that is empty, or that is all dots (`.`, `..`), returns "" and the
+      caller falls back to the field name alone. Traversal cannot survive a
+      whitelist that excludes `/`, but `..` is refused explicitly because it is
+      the one leftover that is still a meaningful path.
+    """
+    name = os.path.basename(filename or "")
+    if extension and name.lower().endswith(extension.lower()):
+        name = name[: -len(extension)]
+    cleaned = _SAFE_STEM.sub("_", name).strip("._")
+    if not cleaned or set(cleaned) <= {"."}:
+        return ""
+    return cleaned[:_MAX_STEM]
+
+
 def _checked_extension(tool, field_name: str, filename: str) -> str:
     """The extension an input will be saved under, or a 400 naming what was
     allowed. Shared by the multipart path and the chunked one so an upload is
@@ -758,7 +803,12 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
             extension = _checked_extension(tool, field_name, upload.filename or "")
-            input_path = os.path.join(work_dir, f"{field_name}{extension}")
+            # The field name stays as a prefix so the argument a file belongs to
+            # is still readable; the patient's own name follows it, so a batch's
+            # outputs can be told apart without counting requests.
+            stem = _safe_stem(upload.filename or "", extension)
+            base = f"{field_name}_{stem}" if stem else field_name
+            input_path = os.path.join(work_dir, f"{base}{extension}")
             try:
                 size += await _stream_to_disk(upload, input_path, upload_limit_bytes)
             except _UploadTooLargeError:
