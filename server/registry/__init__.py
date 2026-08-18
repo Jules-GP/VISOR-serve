@@ -320,6 +320,10 @@ def _check_deployment_config(registry: dict) -> None:
 
 
 
+class NoToolsLoaded(RuntimeError):
+    """Every packaged tool on disk failed to load. The deployment is broken."""
+
+
 class UnknownSupervisedCall(RuntimeError):
     """A tool asks the supervisor for a tool this server does not serve."""
 
@@ -357,6 +361,52 @@ def _check_supervised_calls(registry: dict) -> None:
         "{}. Serving them would mean accepting requests that cannot finish. "
         "Either deploy the missing tools, or fix the call name.".format(detail)
     )
+
+
+
+def _refuse_if_nothing_packaged_loaded(registry: dict) -> None:
+    """Refuse to start when EVERY packaged tool on disk failed to load.
+
+    One tool failing costs one tool -- it is skipped, reported, and the server
+    serves the rest. That is right when the fault is the tool's. It is wrong
+    when every one of them failed, because then the fault is not in any tool: it
+    is the deployment. A missing DESCRIBE_PATH, an unwritable SCHEMA_CACHE_DIR,
+    a TOOLS_DIR mounted at a path the virtualenvs were not built for -- each of
+    those takes out all eight at once.
+
+    What made that dangerous is what it looked like. The server started, logged
+    its failures, and went on to serve `Example_Tool` and `Test_Tool` -- two
+    fixtures. A registry of 2 reads as a small deployment, not a broken one, and
+    a client asking for AMASSS got a 404 that says "unknown tool", which is the
+    same answer it would get for a typo.
+
+    Same principle as the stale-schema refusal, one level up: refusing to start
+    is the only response that cannot be mistaken for working.
+    """
+    on_disk = [name for name, _ in _tool_folders(settings.TOOLS_DIR)]
+    packaged = [
+        name for name, folder in _tool_folders(settings.TOOLS_DIR) if is_packaged(folder)
+    ]
+    loaded_packaged = [name for name in packaged if name in registry]
+    if packaged and not loaded_packaged:
+        raise NoToolsLoaded(
+            "None of the {} packaged tool(s) on disk could be loaded: {}. The server "
+            "would start serving only its in-process fixtures, which reads as a small "
+            "deployment rather than a broken one. Check DESCRIBE_PATH, that "
+            "SCHEMA_CACHE_DIR is writable, and that TOOLS_DIR is mounted at the path "
+            "the virtualenvs were built for. Failures: {}".format(
+                len(packaged),
+                ", ".join(packaged),
+                "; ".join("{}: {}".format(k, v) for k, v in sorted(FAILED_TOOLS.items())),
+            )
+        )
+    if packaged and len(loaded_packaged) < len(packaged):
+        logger.error(
+            "Only %d of %d packaged tool(s) on disk loaded. Missing: %s",
+            len(loaded_packaged),
+            len(packaged),
+            ", ".join(sorted(set(packaged) - set(loaded_packaged))),
+        )
 
 
 def _build_registry() -> dict:
@@ -406,6 +456,8 @@ def _build_registry() -> dict:
         schema_tools,
         ", ".join(sorted(registry)) or "none",
     )
+    _refuse_if_nothing_packaged_loaded(registry)
+
     if FAILED_TOOLS:
         # Repeated here, at the very end of startup, so it survives the wall of
         # uvicorn/framework output that follows and is still on screen.

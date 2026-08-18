@@ -459,3 +459,32 @@ def test_a_tool_declaring_no_calls_is_unaffected(make_tool_folder, monkeypatch):
 
     built = registry._build_registry()
     assert built["Solo"].calls == ()
+
+
+def test_the_server_refuses_to_start_when_every_packaged_tool_failed(
+    make_tool_folder, monkeypatch
+):
+    """One tool failing costs one tool; ALL of them failing is the deployment.
+
+    The shape that made this necessary: with DESCRIBE_PATH unset and no cached
+    schemas, all eight packaged tools failed, the server started anyway, and it
+    served Example_Tool and Test_Tool. A registry of 2 reads as a small
+    deployment rather than a broken one, and a client asking for AMASSS got the
+    same 404 it would get for a typo.
+    """
+    make_tool_folder("Broken", source_hash="0" * 64)  # never matches the source
+    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
+
+    with pytest.raises(registry.NoToolsLoaded, match="packaged tool"):
+        registry._build_registry()
+
+
+def test_some_tools_failing_still_starts(make_tool_folder, monkeypatch):
+    """The other half: a broken tool beside a working one is skipped, not fatal."""
+    make_tool_folder("Broken", source_hash="0" * 64)
+    make_tool_folder("Fine")
+    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
+
+    built = registry._build_registry()
+    assert "Fine" in built
+    assert "Broken" not in built
