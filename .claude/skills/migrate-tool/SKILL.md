@@ -1,6 +1,6 @@
 ---
 name: migrate-tool
-description: Migrate a Slicer module into a packaged SADT tool, or split an existing tool whose two engines have incompatible dependencies. Use when porting a tool from SlicerAutomatedDentalTools, when a tool needs its own pinned torch, or when adding a tool to sadt-tools.
+description: Migrate a Slicer module into a packaged SADT tool, or split an existing tool whose two engines have incompatible dependencies, then update the Slicer client module that calls it. Use when porting a tool from SlicerAutomatedDentalTools, when a tool needs its own pinned torch, or when adding a tool to sadt-tools.
 ---
 
 # Migrating a tool
@@ -147,6 +147,60 @@ grep -rn "sup.run(" tools/*/src tools/*/*/src
 
 Also check `deployment.toml`: a tool's data folder is looked up by name, so a
 split tool no longer matches `DATA/<old name>/` and needs `data_dir`.
+
+And the Slicer module, which calls the tool by name and is the caller a
+clinician sees fail. A split renames by definition, so section 8 is not
+optional after one.
+
+## 8. Update the client
+
+`GET /tools` builds the panel, so a migrated tool renders with no client work at
+all. Four things are **not** derived from the schema, and each of them fails at
+run time rather than at build time.
+
+The client is `SlicerAutomatedDentalToolsCloud`. A module is
+`<Name>/{<Name>.py, CMakeLists.txt, Resources/Icons/<Name>.png, Testing/}`, and
+its own `ARCHITECTURE.md` describes the machinery -- what follows is only what a
+migration has to touch.
+
+**The name the module calls.**
+
+```bash
+grep -rn '^\s*TOOL_NAME = "' <cloud> --include='*.py'
+```
+
+Each must name a tool still served. A pure respelling is already absorbed:
+`client._canonical_tool_name` matches on case and separators, which is why
+`SurgMovPred` still finds `Surg_Mov_Pred`. A split is not absorbed -- a module
+holding `TOOL_NAME = "AREG"` after AREG became `AREG_CBCT`/`AREG_IOS`/
+`AREG_IOSCBCT` shows "Unknown tool", which is what a typo shows.
+
+**The module count.** One upstream module becoming N tools is a decision, not a
+consequence: either N modules, or one module over the tool that dispatches. A
+new module also needs `add_subdirectory(<Name>)` in the **root**
+`CMakeLists.txt` -- without it the module is written, committed and never ships
+(`MedX` sits commented out there today).
+
+**The three overrides**, declared on the widget for the things a schema cannot
+state:
+
+| | declare one when |
+|---|---|
+| `FILE_INPUTS` | the picker the type implies is the wrong one -- a `zip_file` the user holds as a folder, a volume that should come from the scene, an optional file argument to leave out |
+| `RESULT_KIND` | `output_kind: "file"` says a file comes back, not whether to load it into the scene (`volume`/`model`) or offer to save it (`save_as`) |
+| `TEST_DATA` | the original extension published test data; the URL puts a "Test data" button on that argument's row |
+
+A wrong `RESULT_KIND` is a 200 that displays the wrong thing, which no status
+code catches: AMASSS loaded its segmentation as a surface-rendered model until
+it was fixed.
+
+**The test.** `<Name>/Testing/Python/test_<name>_client.py`, driving
+`ServerToolsCoreLib` against the tool's own `GET /tools` schema as a fixture
+with `qt`/`ctk`/`slicer` stubbed, and registered as a plain Python3 ctest in
+the `CMakeLists.txt` beside it -- no Slicer interpreter launched.
+Assert the module's *declarations*, not `<Name>.py` itself: importing it needs a
+real Slicer, and stubbing that far means the test measures the stub.
+`ALI/Testing/Python/` is the shape to copy.
 
 ## Commits
 
